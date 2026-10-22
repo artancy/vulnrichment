@@ -1,0 +1,31 @@
+name: Validate data
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install validator
+        run: npm install --no-save --no-package-lock ajv@8 ajv-formats@3
+
+      - name: Validate changed files
+        if: github.event_name == 'pull_request'
+        run: node .github/scripts/validate-data.js "origin/${{ github.base_ref }}"
+
+      - name: Validate all files
+        if: github.event_name == 'workflow_dispatch'
+        run: node .github/scripts/validate-data.js
