@@ -22,9 +22,9 @@ jobs:
       - name: Install validator
         run: npm install --no-save --no-package-lock ajv@8 ajv-formats@3
 
-      - name: Validate changed files
+      - name: Validate changed files and commits
         if: github.event_name == 'pull_request'
-        run: node .github/scripts/validate-data.js "origin/${{ github.base_ref }}"
+        run: node .github/scripts/validate-data.js "origin/${{ github.base_ref }}" "${{ github.event.pull_request.head.sha }}"
 
       - name: Validate all files
         if: github.event_name == 'workflow_dispatch'
