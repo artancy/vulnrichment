@@ -34,6 +34,8 @@
             "additionalProperties": false,
             "required": ["nodes"],
             "properties": {
+              "operator": { "enum": ["AND", "OR"] },
+              "negate": { "type": "boolean" },
               "nodes": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/node" } }
             }
           }
@@ -80,8 +82,8 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["operator"],
-      "anyOf": [{ "required": ["cpeMatch"] }, { "required": ["children"] }],
-      "errorMessage": { "anyOf": "must contain cpeMatch or children" },
+      "not": { "not": { "anyOf": [{ "required": ["cpeMatch"] }, { "required": ["children"] }] } },
+      "errorMessage": { "not": "must contain cpeMatch or children" },
       "properties": {
         "operator": { "enum": ["AND", "OR"] },
         "negate": { "type": "boolean" },
@@ -94,7 +96,7 @@
       "additionalProperties": false,
       "required": ["criteria", "vulnerable"],
       "properties": {
-        "criteria": { "type": "string", "pattern": "^cpe:2\\.3:[aho](:(?:[^:\\\\]|\\\\.)+){10}$" },
+        "criteria": { "type": "string", "pattern": "^cpe:2\\.3:[aho](:(?:[^:\\\\\\s]|\\\\[^\\s])+){10}$" },
         "vulnerable": { "type": "boolean" },
         "versionStartIncluding": { "$ref": "#/$defs/version" },
         "versionStartExcluding": { "$ref": "#/$defs/version" },
@@ -109,7 +111,7 @@
       },
       "errorMessage": { "not": "must not set both the Including and Excluding variant of versionStart or versionEnd" }
     },
-    "version": { "type": "string", "minLength": 1, "pattern": "^\\S+$" },
+    "version": { "type": "string", "pattern": "^\\S+$" },
     "cvssMetric": {
       "type": "array",
       "minItems": 1,

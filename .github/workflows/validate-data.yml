@@ -4,10 +4,15 @@ name: Validate data
 # so a pull request cannot weaken its own check. The PR is only read as git data, never executed.
 on:
   pull_request_target:
+    types: [opened, synchronize, reopened, edited]
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: validate-data-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   validate:
@@ -21,23 +26,23 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
 
       - name: Install validator
-        run: npm install --no-save --no-package-lock ajv@8 ajv-formats@3 ajv-errors@3
+        run: npm install --no-save --no-package-lock --ignore-scripts ajv@8.20.0 ajv-formats@3.0.1 ajv-errors@3.0.0
 
       - name: Fetch pull request commits
         if: github.event_name == 'pull_request_target'
         env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: git fetch --no-tags origin "refs/pull/$PR_NUMBER/head"
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git fetch --no-tags origin "$HEAD_SHA"
 
       - name: Validate changed files and commits
         if: github.event_name == 'pull_request_target'
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ github.base_ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: node .github/scripts/validate-data.js "$BASE_SHA" "$HEAD_SHA"
+        run: node .github/scripts/validate-data.js "origin/$BASE_REF" "$HEAD_SHA"
 
       - name: Validate all files
         if: github.event_name == 'workflow_dispatch'

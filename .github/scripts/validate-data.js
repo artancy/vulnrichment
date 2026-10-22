@@ -1,8 +1,6 @@
-// Validates data/<year>/CVE-<year>-<id>.json files against schemas/vulnrichment.schema.json
-// and checks that every commit changes one data file with a matching message.
-// Usage: node .github/scripts/validate-data.js [baseRef] [headRef]
-//   with refs: files and commits added since baseRef, e.g. <base sha> <pr head sha>
-//   without:   every tracked file under data/, no commit checks
+// Validates data/<year>/CVE-<year>-<id>.json files and the commits that change them.
+// Usage: node .github/scripts/validate-data.js                 every data file in HEAD
+//        node .github/scripts/validate-data.js <base> <head>   files and commits that <head> adds to <base>
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
@@ -12,117 +10,110 @@ const addErrors = require('ajv-errors');
 
 const FILE_PATH = /^data\/(\d{4})\/(CVE-(\d{4})-\d{4,})\.json$/;
 const ACTIONS = { A: 'add', M: 'modify', D: 'delete' };
-
-process.chdir(path.join(__dirname, '..', '..'));
-
-// strictTypes off so metrics can extend the shared cvssMetric definition;
-// strictRequired off so a node can require cpeMatch or children inside anyOf
-const ajv = new Ajv2020({ allErrors: true, strict: true, strictTypes: false, strictRequired: false });
-addFormats(ajv);
-addErrors(ajv); // replaces anyOf/not noise with the schema's errorMessage text
-const validateSchema = ajv.compile(JSON.parse(fs.readFileSync('schemas/vulnrichment.schema.json', 'utf8')));
+const RANGE_KEYS = ['versionStartIncluding', 'versionStartExcluding', 'versionEndIncluding', 'versionEndExcluding'];
 
 let errorCount = 0;
 try {
-    run(process.argv.slice(2));
+    const [base, head] = process.argv.slice(2);
+    if (base && !head) throw new Error('pass both <base> and <head>, or neither');
+    if (base?.startsWith('-') || head?.startsWith('-')) throw new Error('refs must not start with "-"');
+    process.chdir(path.join(__dirname, '..', '..'));
+
+    // strictTypes/strictRequired off: the schema extends a shared CVSS definition and uses required inside not/anyOf
+    const ajv = new Ajv2020({ allErrors: true, strict: true, strictTypes: false, strictRequired: false });
+    addFormats(ajv);
+    addErrors(ajv);
+    const validate = ajv.compile(JSON.parse(fs.readFileSync('schemas/vulnrichment.schema.json', 'utf8')));
+
+    // Every changed file except deletions, so a file turned into a symlink is checked too
+    const ref = head ?? 'HEAD';
+    const files = (base
+        ? git(['diff', '--name-only', '-z', '--no-renames', '--diff-filter=d', `${base}...${head}`, '--', 'data/'])
+        : git(['ls-tree', '-r', '-z', '--name-only', ref, '--', 'data/'])
+    ).split('\0').filter(Boolean);
+    const commits = base ? git(['rev-list', '--reverse', `${base}..${head}`]).split('\n').filter(Boolean) : [];
+
+    for (const file of files) {
+        const match = file.match(FILE_PATH);
+        if (!match) {
+            report(file, `Invalid path "${file}": expected data/<year>/CVE-<year>-<id>.json.`);
+            continue;
+        }
+        const [, folderYear, cveId, cveYear] = match;
+        if (folderYear !== cveYear) {
+            report(file, `Invalid location "${file}": ${cveId} belongs in data/${cveYear}/.`);
+            continue;
+        }
+
+        let record;
+        try {
+            // Stored bytes from git: a symlink gives its target path and is never followed; invalid UTF-8 and a BOM fail
+            const bytes = git(['cat-file', 'blob', `${ref}:${file}`], 'buffer');
+            record = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes));
+        } catch (err) {
+            report(file, `Invalid JSON in ${file}: ${err.message.trim()}`);
+            continue;
+        }
+
+        if (!validate(record)) {
+            for (const err of validate.errors) {
+                const detail = err.params.additionalProperty ?? err.params.allowedValues?.join(', ') ?? err.params.allowedValue;
+                report(file, `Schema error in ${file} at ${err.instancePath || '/'}: ${err.message}${detail === undefined ? '' : ` (${detail})`}.`);
+            }
+            continue;
+        }
+        if (record._annotation.cve_id !== cveId) {
+            report(file, `Wrong cve_id in ${file}: "${record._annotation.cve_id}", expected "${cveId}".`);
+        }
+
+        // A cpeMatch with a version range must use * or - as the version in its criteria
+        const nodes = record.cve.configurations.flatMap(configuration => configuration.nodes);
+        while (nodes.length) {
+            const node = nodes.pop();
+            nodes.push(...(node.children ?? []));
+            for (const cpe of node.cpeMatch ?? []) {
+                const version = cpe.criteria.split(/(?<!\\):/)[5]; // "\:" is an escaped colon, not a separator
+                if (RANGE_KEYS.some(key => key in cpe) && version !== '*' && version !== '-') {
+                    report(file, `Invalid range in ${file}: ${cpe.criteria} has a fixed version, so it cannot have a version range.`);
+                }
+            }
+        }
+    }
+
+    for (const sha of commits) {
+        // --root: include a commit without parents; --cc: for a merge, only what the merge itself changed
+        // (one status letter per parent); --no-renames: a rename is a delete plus an add; -z: exact file names
+        const fields = git(['diff-tree', '-r', '--root', '--cc', '--no-renames', '--no-commit-id', '--name-status', '-z', sha]).split('\0').filter(Boolean);
+        const statuses = fields.filter((_, i) => i % 2 === 0);
+        const changed = fields.filter((_, i) => i % 2 === 1);
+        if (!changed.some(name => name.startsWith('data/'))) continue;
+
+        const subject = git(['log', '-1', '--format=%s', sha]).trim();
+        const label = `Commit ${sha.slice(0, 7)} ("${subject}")`;
+        const [status, file] = fields;
+        const expected = `${ACTIONS[status]} ${path.posix.basename(file, path.posix.extname(file))}`;
+        if (statuses.some(s => s.length > 1)) report(null, `${label} is a merge that changes ${changed.join(', ')} itself; make data changes in regular commits.`);
+        else if (changed.length !== 1) report(null, `${label} changes ${changed.length} files; a commit must change exactly one (split a rename into a delete and an add).`);
+        else if (!ACTIONS[status]) report(null, `${label} changes ${file} with unsupported git status ${status}.`);
+        else if (subject !== expected) report(null, `${label} must have the message "${expected}".`);
+    }
+
+    console.log(`Validated ${files.length} file(s) and ${commits.length} commit(s): ${errorCount} error(s).`);
 } catch (err) {
-    report(null, `The validator could not run: ${err.message.trim()}`);
+    report(null, `Validation could not run: ${err.message.trim()}`);
 }
 process.exitCode = errorCount ? 1 : 0;
 
-function run([baseRef, headRef]) {
-    if (baseRef && !headRef) throw new Error('both a base ref and a head ref are required.');
-    const base = baseRef && resolve(baseRef);
-    const head = headRef && resolve(headRef);
-    if (base && git('rev-parse', '--is-shallow-repository').trim() === 'true') {
-        throw new Error('the repository is a shallow clone; check it out with fetch-depth: 0.');
-    }
-
-    const files = base
-        ? split(git('diff', '--name-only', '-z', '--no-renames', '--diff-filter=AM', `${base}...${head}`, '--', 'data/'))
-        : split(git('ls-files', '-z', '--', 'data/'));
-    const commits = base ? split(git('rev-list', '--reverse', `${base}..${head}`), '\n') : [];
-
-    const read = file => (base ? git('show', `${head}:${file}`) : fs.readFileSync(file, 'utf8'));
-    files.forEach(file => validateFile(file, read).forEach(message => report(file, message)));
-    commits.forEach(sha => validateCommit(sha).forEach(message => report(null, message)));
-
-    console.log(`Validated ${files.length} file(s) and ${commits.length} commit(s): ${errorCount} error(s) found.`);
-}
-
-function validateFile(file, read) {
-    const match = file.match(FILE_PATH);
-    if (!match) return [`Invalid path: "${file}" must follow the format data/<year>/CVE-<year>-<id>.json.`];
-    const [, folderYear, cveId, cveYear] = match;
-    if (folderYear !== cveYear) return [`Invalid location: ${cveId} belongs in data/${cveYear}, not data/${folderYear}.`];
-
-    let record;
-    try {
-        record = JSON.parse(read(file));
-    } catch (err) {
-        return [`Invalid JSON: the file could not be parsed (${err.message}).`];
-    }
-
-    // Errors from inside anyOf branches are summarised by the anyOf error itself
-    const errors = validateSchema(record) ? [] : validateSchema.errors
-        .filter(err => !err.schemaPath.includes('/anyOf/'))
-        .map(formatSchemaError);
-    const annotatedId = record?._annotation?.cve_id;
-    if (annotatedId && annotatedId !== cveId) {
-        errors.push(`Identifier mismatch: _annotation.cve_id is "${annotatedId}", but the file name requires "${cveId}".`);
-    }
-    return errors;
-}
-
-function formatSchemaError(err) {
-    const extra = err.params.additionalProperty ?? err.params.allowedValues?.join(', ') ?? err.params.allowedValue;
-    return `Schema violation at ${err.instancePath || '/'}: ${err.message}${extra === undefined ? '' : ` (${extra})`}.`;
-}
-
-function validateCommit(sha) {
-    const subject = git('log', '-1', '--format=%s', sha).trim();
-    const prefix = `Commit ${sha.slice(0, 7)} ("${subject}")`;
-    const isMerge = split(git('rev-list', '--parents', '-n', '1', sha), ' ').length > 2;
-
-    // A merge may only combine its parents; data changes of its own would bypass the rules below
-    if (isMerge) {
-        const own = split(git('diff-tree', '--cc', '--name-only', '--no-commit-id', '-z', sha)).filter(file => file.startsWith('data/'));
-        return own.length ? [`${prefix} is a merge that changes ${own.join(', ')} itself. Make data changes in regular commits.`] : [];
-    }
-
-    // -z output alternates status and path; without rename detection a rename is a delete plus an add
-    const fields = split(git('diff-tree', '-r', '--no-commit-id', '--no-renames', '--name-status', '-z', sha));
-    const changes = [];
-    for (let i = 0; i < fields.length; i += 2) changes.push({ status: fields[i], file: fields[i + 1] });
-    if (!changes.some(({ file }) => file.startsWith('data/'))) return [];
-
-    if (changes.length !== 1) {
-        return [`${prefix} changes ${changes.length} files. Each commit must add, modify or delete exactly one file; renames must be split into a delete commit and an add commit.`];
-    }
-
-    const { status, file } = changes[0];
-    if (!ACTIONS[status]) return [`${prefix} changes ${file} with git status ${status}. Only adding, modifying and deleting files is permitted.`];
-    const expected = `${ACTIONS[status]} ${path.posix.basename(file).replace(/\.[^.]*$/, '')}`;
-    return subject === expected ? [] : [`${prefix} changes ${file}. The message must be "${expected}".`];
-}
-
-// Escaped so that file contents and commit subjects cannot inject workflow commands
+// Workflow commands are lines starting with "::". Escaping % CR LF (and : , in the file property) stops
+// pull request text, such as a JSON key containing a newline, from starting a command of its own.
 function report(file, message) {
     errorCount++;
-    const data = text => text.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
-    const property = text => data(text).replace(/:/g, '%3A').replace(/,/g, '%2C');
-    console.log(file ? `::error file=${property(file)}::${data(message)}` : `::error::${data(message)}`);
+    const escape = text => text.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+    const property = file ? ` file=${escape(file).replace(/:/g, '%3A').replace(/,/g, '%2C')}` : '';
+    console.log(`::error${property}::${escape(message)}`);
 }
 
-function resolve(ref) {
-    if (ref.startsWith('-')) throw new Error(`"${ref}" is not a valid ref.`);
-    return git('rev-parse', '--verify', '--quiet', `${ref}^{commit}`).trim();
-}
-
-function split(text, separator = '\0') {
-    return (separator === '\0' ? text : text.trim()).split(separator).filter(Boolean);
-}
-
-function git(...args) {
-    return execFileSync('git', args, { encoding: 'utf8', maxBuffer: 1024 ** 3, stdio: ['ignore', 'pipe', 'pipe'] });
+// Runs git directly with an argument list, never through a shell
+function git(args, encoding = 'utf8') {
+    return execFileSync('git', args, { encoding, maxBuffer: 100 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
 }
