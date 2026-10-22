@@ -81,6 +81,7 @@
       "additionalProperties": false,
       "required": ["operator"],
       "anyOf": [{ "required": ["cpeMatch"] }, { "required": ["children"] }],
+      "errorMessage": { "anyOf": "must contain cpeMatch or children" },
       "properties": {
         "operator": { "enum": ["AND", "OR"] },
         "negate": { "type": "boolean" },
@@ -105,7 +106,8 @@
           { "required": ["versionStartIncluding", "versionStartExcluding"] },
           { "required": ["versionEndIncluding", "versionEndExcluding"] }
         ]
-      }
+      },
+      "errorMessage": { "not": "must not set both the Including and Excluding variant of versionStart or versionEnd" }
     },
     "version": { "type": "string", "minLength": 1, "pattern": "^\\S+$" },
     "cvssMetric": {
